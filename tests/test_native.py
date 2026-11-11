@@ -70,7 +70,9 @@ class NativeTests(unittest.TestCase):
         # The ledger deliberately ignores context-local profile overrides. Bind
         # its process home too, so even recovery touches only this disposable DB.
         self.process_home = os.environ.get('HERMES_HOME')
+        self.relay_url_env = os.environ.get('GATEWAY_RELAY_URL')
         os.environ['HERMES_HOME'] = str(self.home)
+        os.environ['GATEWAY_RELAY_URL'] = 'wss://connector.invalid/relay'
         self.token = set_hermes_home_override(self.home)
         self.addCleanup(self._restore_home)
         shutil.copytree(PLUGIN, self.home / "plugins" / "warning-filter",
@@ -80,10 +82,14 @@ class NativeTests(unittest.TestCase):
         self.addCleanup(self.manager.unload)
         self.manager.discover_and_load()
         # Same order as gateway startup: discovery, THEN native core Relay registration.
-        self.assertTrue(register_relay_adapter(force=True, url=""))
+        self.assertTrue(register_relay_adapter())
 
     def _restore_home(self):
         reset_hermes_home_override(self.token)
+        if self.relay_url_env is None:
+            os.environ.pop('GATEWAY_RELAY_URL', None)
+        else:
+            os.environ['GATEWAY_RELAY_URL'] = self.relay_url_env
         if self.process_home is None:
             os.environ.pop('HERMES_HOME', None)
         else:
@@ -637,6 +643,130 @@ class NativeTests(unittest.TestCase):
                 self.assertEqual(result.raw_response, {"filtered": True, "delivered": False})
                 self.assertFalse(result.retryable)
                 self.assertIsNone(result.message_id)
+
+
+class RelayBootTests(unittest.TestCase):
+    """Optional Relay admission through native discovery/config and factory consumers."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='relay-boot-', dir=os.environ['TMPDIR'])
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        self.saved_env = {k: v for k, v in os.environ.items() if k.startswith('GATEWAY_RELAY_')}
+        for key in self.saved_env:
+            os.environ.pop(key)
+        self.process_home = os.environ.get('HERMES_HOME')
+        os.environ['HERMES_HOME'] = str(self.home)
+        self.token = set_hermes_home_override(self.home)
+        self.addCleanup(self.restore)
+        shutil.copytree(PLUGIN, self.home / 'plugins' / 'warning-filter',
+                        ignore=shutil.ignore_patterns('__pycache__', '.git'))
+        self.manager = PluginManager(str(self.home))
+        self.addCleanup(self.manager.unload)
+
+    def restore(self):
+        reset_hermes_home_override(self.token)
+        if self.process_home is None:
+            os.environ.pop('HERMES_HOME', None)
+        else:
+            os.environ['HERMES_HOME'] = self.process_home
+        for key in list(os.environ):
+            if key.startswith('GATEWAY_RELAY_'):
+                os.environ.pop(key)
+        os.environ.update(self.saved_env)
+
+    def boot(self, *, url=False, disabled=False):
+        from gateway.config import load_gateway_config
+        config = {'plugins': {'enabled': ['warning-filter']}}
+        if url:
+            config['gateway'] = {'relay_url': 'wss://connector.invalid/relay',
+                                 'relay_id': 'synthetic-gateway', 'relay_secret': 'synthetic-secret'}
+        if disabled:
+            config['platforms'] = {'relay': {'enabled': False}}
+        (self.home / 'config.yaml').write_text(json.dumps(config))
+        self.manager.discover_and_load()
+        registered = register_relay_adapter()
+        loaded = load_gateway_config()
+        from gateway.config import Platform
+        relay = loaded.platforms.get(Platform.RELAY)
+        adapter = platform_registry.create_adapter('relay', relay or PlatformConfig())
+        print('RELAY BOOT', 'url', url, 'disabled', disabled, 'registered', registered,
+              'enabled', bool(relay and relay.enabled), 'adapter', type(adapter).__name__, flush=True)
+        return registered, relay, adapter
+
+    def test_absent_url_does_not_autodetect_relay(self):
+        registered, relay, adapter = self.boot()
+        self.assertFalse(registered)
+        self.assertFalse(relay and relay.enabled, 'unconfigured Relay must not enter startup')
+        self.assertIsNone(adapter)
+
+    def test_explicit_disable_with_url(self):
+        registered, relay, adapter = self.boot(url=True, disabled=True)
+        self.assertFalse(registered)
+        self.assertFalse(relay.enabled)
+        self.assertIsNone(adapter)
+
+    def test_configured_url_native_factory(self):
+        registered, relay, adapter = self.boot(url=True)
+        self.assertTrue(registered)
+        self.assertTrue(relay.enabled)
+        self.assertIsNotNone(adapter)
+        self.assertTrue(any(c.__name__ == 'WarningFilter' for c in type(adapter).__mro__))
+        self.assertEqual(adapter._transport._gateway_id, 'synthetic-gateway')
+        self.assertEqual(adapter._transport._upgrade_secret, 'synthetic-secret')
+
+    def test_explicit_disable_vetoes_environment_url(self):
+        os.environ['GATEWAY_RELAY_URL'] = 'wss://connector.invalid/relay'
+        registered, relay, adapter = self.boot(disabled=True)
+        self.assertFalse(registered)
+        self.assertFalse(relay and relay.enabled)
+        self.assertIsNone(adapter)
+
+    def test_late_url_after_discovery(self):
+        from gateway.config import load_gateway_config, Platform
+        self.boot()
+        # Model only the output of provisioning, never its network/authentication work.
+        os.environ['GATEWAY_RELAY_URL'] = 'wss://late.invalid/relay'
+        os.environ['GATEWAY_RELAY_ID'] = 'late-gateway'
+        os.environ['GATEWAY_RELAY_SECRET'] = 'late-secret'
+        self.assertTrue(register_relay_adapter())
+        config = load_gateway_config()
+        self.assertTrue(config.platforms[Platform.RELAY].enabled)
+        adapter = platform_registry.create_adapter('relay', config.platforms[Platform.RELAY])
+        self.assertIsNotNone(adapter)
+        self.assertEqual(adapter._transport._url, 'wss://late.invalid/relay')
+        self.assertEqual(adapter._transport._gateway_id, 'late-gateway')
+        self.assertFalse(asyncio.run(adapter.send('C_TEST', SILENCE)).success)
+
+    def test_global_registration_does_not_activate_other_profile(self):
+        from gateway.config import load_gateway_config, Platform
+        self.boot(url=True)
+        other = self.home / 'other-profile'
+        other.mkdir()
+        shutil.copytree(PLUGIN, other / 'plugins' / 'warning-filter',
+                        ignore=shutil.ignore_patterns('__pycache__', '.git'))
+        (other / 'config.yaml').write_text(json.dumps({'plugins': {'enabled': ['warning-filter']}}))
+        token = set_hermes_home_override(other)
+        os.environ['HERMES_HOME'] = str(other)
+        manager = PluginManager(str(other))
+        try:
+            manager.discover_and_load()
+            config = load_gateway_config()
+            relay = config.platforms.get(Platform.RELAY)
+            self.assertFalse(relay and relay.enabled)
+            self.assertIsNone(platform_registry.create_adapter('relay', PlatformConfig()))
+            os.environ['GATEWAY_RELAY_URL'] = 'wss://other.invalid/relay'
+            adapter = platform_registry.create_adapter('relay', PlatformConfig())
+            self.assertIsNotNone(adapter)
+            self.assertEqual(adapter._transport._url, 'wss://other.invalid/relay')
+        finally:
+            manager.unload()
+            os.environ.pop('GATEWAY_RELAY_URL', None)
+            os.environ['HERMES_HOME'] = str(self.home)
+            reset_hermes_home_override(token)
+        adapter = platform_registry.create_adapter('relay', PlatformConfig())
+        self.assertEqual(adapter._transport._url, 'wss://connector.invalid/relay')
+        self.assertEqual(adapter._transport._gateway_id, 'synthetic-gateway')
 
 
 if __name__ == "__main__":

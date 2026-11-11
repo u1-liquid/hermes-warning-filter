@@ -1,10 +1,11 @@
 """Native profile-scoped adapter registrations; no installed-source changes."""
-from dataclasses import fields
+from dataclasses import fields, replace
 import logging
 import re
 
 from gateway.platforms.base import SendResult
 from gateway.platform_registry import PlatformEntry, platform_registry
+from gateway.relay import register_relay_adapter, relay_url
 from gateway.relay.adapter import RelayAdapter
 
 
@@ -122,8 +123,9 @@ def register(ctx):
                                                   reply_to=reply_to, metadata=metadata)
 
     def relay_factory(config):
-        # Core registers Relay after plugin discovery and refreshes it on startup.
-        # Read its current public snapshot, never displace its global registration.
+        # Resolve in the consuming profile, including URLs provisioned after discovery.
+        # Core retains ownership of transport construction and authentication.
+        register_relay_adapter()
         entry, _ = platform_registry.snapshot_registration("relay")
         if entry is None:
             raise RuntimeError("Core Relay factory has not been registered")
@@ -131,5 +133,8 @@ def register(ctx):
         return FilteredRelay(config, native.descriptor, transport=native._transport)
 
     relay, _ = platform_registry.snapshot_registration("relay")
-    _register_entry(ctx, relay or PlatformEntry("relay", "Relay", relay_factory, lambda: True,
-                                              source="builtin"), relay_factory)
+    # Discovery precedes optional native registration. A scoped overlay must not
+    # advertise a configured Relay merely because another profile registered one.
+    relay = relay or PlatformEntry("relay", "Relay", relay_factory, lambda: False,
+                                  source="builtin", emoji="🔌")
+    _register_entry(ctx, replace(relay, check_fn=lambda: bool(relay_url())), relay_factory)
