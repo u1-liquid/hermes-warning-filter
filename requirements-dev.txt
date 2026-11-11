@@ -4,10 +4,10 @@ slack-sdk==3.46.0
 aiohttp==3.14.5
 ruamel.yaml==0.19.1
 python-dotenv==1.2.4
-rich==14.3.4
+rich==15.0.0
 httpx==0.28.1
 # Native manifest dependency parsing (pm/plugin_declarations.py).
 packaging==26.3
 # Native Relay factory/auth construction and bundled plugin discovery.
-websockets==15.0.1
+websockets==17.4
 requests==2.34.2
