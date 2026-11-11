@@ -1,0 +1,13 @@
+name: warning-filter
+version: 0.1.0
+manifest_version: 2
+api_version: 1
+kind: standalone
+description: Suppress configured complete gateway warnings on Slack and Relay.
+config_schema:
+  patterns:
+    type: list
+    default:
+      - 'The model returned only a silence marker for a message that needed a reply\. Try again or rephrase\.'
+      - "auxiliary\\.background_review\\.reasoning_effort='[^'\\r\\n]+' has no effect while the review model is not the main model"
+    description: Python regex strings matched against the full normalized message. An explicit list replaces defaults; an empty list suppresses nothing.
