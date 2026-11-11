@@ -1,0 +1,15 @@
+name: warning-filter
+version: 0.1.0
+manifest_version: 2
+api_version: 1
+kind: standalone
+description: Suppress two complete native gateway warnings on Slack and Relay.
+config_schema:
+  suppress_unexpected_silence:
+    type: bool
+    default: true
+    description: Suppress the complete unexpected-silence warning.
+  suppress_reasoning_effort:
+    type: bool
+    default: true
+    description: Suppress the complete ineffective background-review effort warning.

@@ -1,0 +1,43 @@
+name: Native tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      HERMES_DISABLE_LAZY_INSTALLS: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+      - name: Immutable official host source
+        uses: actions/checkout@v7
+        with:
+          repository: NousResearch/hermes-agent
+          ref: 2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19
+          path: .host-staging
+          persist-credentials: false
+      - name: Prepare separate runtime and disposable homes
+        # Only runner-owned paths enter shell commands; no event/PR text is evaluated.
+        env:
+          TEST_ROOT: ${{ runner.temp }}/warning-filter
+        run: |
+          mkdir -p "$TEST_ROOT/home" "$TEST_ROOT/scratch" "$TEST_ROOT/store"
+          mv .host-staging "$TEST_ROOT/host"
+          python -m venv "$TEST_ROOT/env"
+          "$TEST_ROOT/env/bin/python" -m pip install -r requirements-dev.txt
+          printf '%s\n' "HERMES_HOME=$TEST_ROOT/home" "HERMES_RUNTIME_DIR=$TEST_ROOT/store" "TMPDIR=$TEST_ROOT/scratch" "PYTHONPATH=$TEST_ROOT/host" "TEST_ROOT=$TEST_ROOT" >> "$GITHUB_ENV"
+      - name: Native regression suite (setup and import errors fail)
+        run: |
+          "$TEST_ROOT/env/bin/python" --version
+          "$TEST_ROOT/env/bin/python" -m unittest discover -s tests -p test_native.py -v
+      - name: Native source validation (coupling warnings remain visible)
+        run: '"$TEST_ROOT/env/bin/python" -m hermes_cli.main plugins validate . --json'
