@@ -1,5 +1,6 @@
 """Native profile-scoped adapter registrations; no installed-source changes."""
 from dataclasses import fields
+import logging
 import re
 
 from gateway.platforms.base import SendResult
@@ -7,8 +8,7 @@ from gateway.platform_registry import PlatformEntry, platform_registry
 from gateway.relay.adapter import RelayAdapter
 
 
-_SILENCE = "The model returned only a silence marker for a message that needed a reply. Try again or rephrase."
-_EFFORT = re.compile(r"auxiliary\.background_review\.reasoning_effort='[^'\r\n]+' has no effect while the review model is not the main model")
+logger = logging.getLogger('warning-filter')
 
 
 class WarningFilter:
@@ -20,8 +20,7 @@ class WarningFilter:
             if text.startswith(prefix):
                 text = text[len(prefix):]
                 break
-        if ((self._suppress_silence and text == _SILENCE)
-                or (self._suppress_effort and _EFFORT.fullmatch(text))):
+        if any(pattern.fullmatch(text) for pattern in self._patterns):
             return SendResult(success=False, error="warning-filter: filtered; not delivered",
                               raw_response={"filtered": True, "delivered": False}, retryable=False)
         return None
@@ -74,8 +73,27 @@ def _register_entry(ctx, entry, factory):
 
 
 def register(ctx):
-    silence = ctx.get_config("suppress_unexpected_silence", True) is not False
-    effort = ctx.get_config("suppress_reasoning_effort", True) is not False
+    manifest = getattr(ctx, 'manifest', None)
+    if manifest is None:
+        # Native validation probes omit manifest; use the host's same parser.
+        from pathlib import Path
+        from hermes_cli.plugins_manifest import parse_manifest_file
+        root = Path(__file__).resolve().parent
+        manifest = parse_manifest_file(root / 'plugin.yaml', root, 'user', '')
+    configured = ctx.get_config('patterns', manifest.config_schema['patterns']['default'])
+    patterns = []
+    if not isinstance(configured, list):
+        logger.warning('patterns must be a list; no messages will be suppressed')
+    else:
+        for index, pattern in enumerate(configured):
+            if not isinstance(pattern, str):
+                logger.warning('patterns[%d] must be a string; rule ignored', index)
+                continue
+            try:
+                patterns.append(re.compile(pattern))
+            except (re.error, OverflowError):
+                logger.warning('patterns[%d] invalid regex; rule ignored', index)
+    patterns = tuple(patterns)
     # Reuse the bundled registrar rather than resolving a deferred loader while
     # another plugin's deadline worker owns the discovery lock.
     from plugins.platforms.slack.adapter import register as register_slack
@@ -83,8 +101,7 @@ def register(ctx):
     slack = platform_registry.get("slack")
     if slack is not None:
         class FilteredSlack(WarningFilter, slack.adapter_factory):
-            _suppress_silence = silence
-            _suppress_effort = effort
+            _patterns = patterns
 
             async def send_or_update_status(self, chat_id, status_key, content, *, metadata=None):
                 result = self._filtered(content)
@@ -95,8 +112,7 @@ def register(ctx):
         _register_entry(ctx, slack, FilteredSlack)
 
     class FilteredRelay(WarningFilter, RelayAdapter):
-        _suppress_silence = silence
-        _suppress_effort = effort
+        _patterns = patterns
 
         async def send_for_platform(self, logical_platform, chat_id, content, reply_to=None, metadata=None):
             result = self._filtered(content)

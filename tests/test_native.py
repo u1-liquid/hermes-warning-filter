@@ -154,6 +154,7 @@ class NativeTests(unittest.TestCase):
         asyncio.run(exercise())
 
     def test_final_ledger_controls(self):
+        self.configure_patterns(self.default_patterns() + [r'Custom maintenance warning: retry in \d+ seconds\.'])
         from dataclasses import replace
         from gateway.config import Platform
         from gateway.platforms.event import MessageEvent
@@ -211,7 +212,7 @@ class NativeTests(unittest.TestCase):
                 live.gateway_runner = runner
                 md = {'thread_id': '9', 'team_id': 'T_TEST', '_relay_logical_platform': 'slack'}
                 before_rows = rows()
-                for index, warning in enumerate((SILENCE, EFFORT)):
+                for index, warning in enumerate((SILENCE, EFFORT, 'Custom maintenance warning: retry in 17 seconds.')):
                     e = event(name + '-blocked-' + str(index))
                     result, owner = await old.send_final_ledgered(e, e.message_id, warning, md, reply_to='9')
                     self.assertIs(owner, live)
@@ -359,15 +360,24 @@ class NativeTests(unittest.TestCase):
             self.assertTrue(result.success, result.error)
             self.assertEqual(io.calls[-1][0], "edit")
 
-    def test_independent_settings_and_profile_isolation(self):
-        for key, allowed, blocked in (
-            ("suppress_unexpected_silence", SILENCE, EFFORT),
-            ("suppress_reasoning_effort", EFFORT, SILENCE),
+    def configure_patterns(self, patterns):
+        self.manager.unload()
+        (self.home / "config.yaml").write_text(json.dumps({"plugins": {
+            "enabled": ["warning-filter"], "entries": {"warning-filter": {
+                "settings": {"patterns": patterns}}}}}))
+        self.manager.discover_and_load(force=True)
+
+    def default_patterns(self):
+        from hermes_cli.plugins_manifest import parse_manifest_file
+        return parse_manifest_file(PLUGIN / 'plugin.yaml', PLUGIN, 'user', '').config_schema['patterns']['default']
+
+    def test_patterns_removal_and_profile_isolation(self):
+        defaults = self.default_patterns()
+        for key, patterns, allowed, blocked in (
+            ('silence-removed', defaults[1:], SILENCE, EFFORT),
+            ('effort-removed', defaults[:1], EFFORT, SILENCE),
         ):
-            self.manager.unload()
-            (self.home / "config.yaml").write_text(json.dumps({"plugins": {
-                "enabled": ["warning-filter"], "entries": {"warning-filter": {"settings": {key: False}}}}}))
-            self.manager.discover_and_load(force=True)
+            self.configure_patterns(patterns)
             for name in ("slack", "relay"):
                 adapter, io = self.controlled_adapter(name)
                 self.assertTrue(asyncio.run(adapter.send("C_TEST", allowed)).success)
@@ -387,13 +397,81 @@ class NativeTests(unittest.TestCase):
                 self.assertEqual(len(io.calls), 2)
         other = self.home / "other-profile"
         other.mkdir()
+        shutil.copytree(PLUGIN, other / 'plugins' / 'warning-filter',
+                        ignore=shutil.ignore_patterns('__pycache__'))
+        (other / 'config.yaml').write_text(json.dumps({'plugins': {
+            'enabled': ['warning-filter'], 'entries': {'warning-filter': {
+                'settings': {'patterns': []}}}}}))
         token = set_hermes_home_override(other)
+        process_home = os.environ['HERMES_HOME']
+        os.environ['HERMES_HOME'] = str(other)
+        other_manager = PluginManager(str(other))
         try:
             self.assertNotEqual(platform_registry.get("relay").plugin_name, "warning-filter")
+            other_manager.discover_and_load()
+            for name in ('slack', 'relay'):
+                adapter, io = self.controlled_adapter(name)
+                self.assertTrue(asyncio.run(adapter.send('C_TEST', SILENCE)).success)
+                self.assertTrue(asyncio.run(adapter.send('C_TEST', EFFORT)).success)
+                self.assertEqual(len(io.calls), 2)
         finally:
+            other_manager.unload()
+            os.environ['HERMES_HOME'] = process_home
             reset_hermes_home_override(token)
+        for name in ('slack', 'relay'):
+            adapter, io = self.controlled_adapter(name)
+            self.assertFalse(asyncio.run(adapter.send('C_TEST', SILENCE)).success)
+            self.assertTrue(asyncio.run(adapter.send('C_TEST', EFFORT)).success)
+            self.assertEqual(len(io.calls), 1)
         self.manager.unload()
         self.assertNotEqual(platform_registry.get("relay").plugin_name, "warning-filter")
+
+    def test_custom_replacement_empty_and_full_message_safety(self):
+        custom = r'Custom maintenance warning: retry in \d+ seconds\.'
+        warning = 'Custom maintenance warning: retry in 17 seconds.'
+        for patterns in ([custom], []):
+            self.configure_patterns(patterns)
+            for name in ('slack', 'relay'):
+                adapter, io = self.controlled_adapter(name)
+                result = asyncio.run(adapter.send('C_TEST', ' \n⚠️ ' + warning + '\n '))
+                self.assertEqual(result.success, not patterns)
+                if patterns:
+                    self.assertEqual(result.raw_response, {'filtered': True, 'delivered': False})
+                    self.assertEqual(io.calls, [])
+                for text in (SILENCE, EFFORT, 'ordinary', '⚠ unrelated warning',
+                             'Quoted: "' + warning + '"', 'Useful answer\n' + warning,
+                             warning + '\nUseful answer'):
+                    self.assertTrue(asyncio.run(adapter.send('C_TEST', text)).success)
+                self.assertEqual(len(io.calls), 7 + (not patterns))
+
+    def test_invalid_patterns_diagnostics_and_fail_open(self):
+        for patterns, diagnostic in (
+            (None, 'patterns must be a list'),
+            ('ordinary', 'patterns must be a list'),
+            ({'rule': 'ordinary'}, 'patterns must be a list'),
+            ([None, 7, False, {}, [], '['], 'patterns[0] must be a string'),
+            (['['], 'patterns[0] invalid regex'),
+        ):
+            with self.subTest(patterns=patterns):
+                with self.assertLogs('warning-filter', level='WARNING') as captured:
+                    self.configure_patterns(patterns)
+                self.assertIn(diagnostic, '\n'.join(captured.output))
+                for name in ('slack', 'relay'):
+                    adapter, io = self.controlled_adapter(name)
+                    for text in (SILENCE, EFFORT, 'ordinary'):
+                        self.assertTrue(asyncio.run(adapter.send('C_TEST', text)).success)
+                    self.assertEqual(len(io.calls), 3)
+        with self.assertLogs('warning-filter', level='WARNING') as captured:
+            self.configure_patterns(['[', 7, 'Custom warning'])
+        self.assertIn('patterns[0] invalid regex', '\n'.join(captured.output))
+        self.assertIn('patterns[1] must be a string', '\n'.join(captured.output))
+        self.assertNotIn('Custom warning', '\n'.join(captured.output))
+        for name in ('slack', 'relay'):
+            adapter, io = self.controlled_adapter(name)
+            self.assertFalse(asyncio.run(adapter.send('C_TEST', 'Custom warning')).success)
+            self.assertTrue(asyncio.run(adapter.send('C_TEST', SILENCE)).success)
+            self.assertTrue(asyncio.run(adapter.send('C_TEST', 'ordinary')).success)
+            self.assertEqual(len(io.calls), 2)
 
     def test_native_retry_policy_and_status_logical_lanes(self):
         for name in ("slack", "relay"):

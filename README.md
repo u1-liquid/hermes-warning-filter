@@ -1,11 +1,11 @@
 # Hermes warning-filter
 
-Suppress two complete gateway warnings before Slack or Relay delivery:
+Suppress configured complete gateway warnings before Slack or Relay delivery. The default regex list covers:
 
 - Unexpected silence: “The model returned only a silence marker for a message that needed a reply. Try again or rephrase.”
 - Ineffective background review effort: `auxiliary.background_review.reasoning_effort='…' has no effect while the review model is not the main model`. The effort value is variable, not limited to `high`.
 
-Both filters are on by default. Matching allows surrounding whitespace and the native warning icon. Ordinary replies, unrelated warnings, quotations and warning text embedded in a useful answer pass through unchanged. Filtered edits do not erase existing content.
+These defaults apply when `patterns` is absent. Matching uses Python `re.fullmatch` after removing surrounding whitespace and one native warning prefix (`⚠️ ` or `⚠ `), not substring searching. Ordinary replies, unrelated warnings, quotations and warning text embedded in a useful answer pass through unchanged with the defaults. Custom patterns define their own complete-message scope; avoid broad expressions such as `.*`. Filtered edits do not erase existing content.
 
 ## Install
 
@@ -21,7 +21,7 @@ The native `--ref` option requires a full 40-character commit SHA, not a branch 
 
 ## Settings
 
-In that profile's `config.yaml`, the two independent keys are:
+In that profile's native plugin settings, `patterns` is a list of Python regex strings. Omit it to use the manifest defaults, or supply the complete replacement list. For example, retain both defaults and add a third warning without changing Python:
 
 ```yaml
 plugins:
@@ -29,15 +29,27 @@ plugins:
   entries:
     warning-filter:
       settings:
-        suppress_unexpected_silence: true
-        suppress_reasoning_effort: true
+        patterns:
+          - 'The model returned only a silence marker for a message that needed a reply\. Try again or rephrase\.'
+          - "auxiliary\\.background_review\\.reasoning_effort='[^'\\r\\n]+' has no effect while the review model is not the main model"
+          - 'Custom maintenance warning: retry in \d+ seconds\.'
 ```
 
-Preserve other enabled plugins when configuring your profile. Set either key to native YAML boolean `false` to opt out of that filter. Strings such as `"false"`, zero and null are not opt-outs. Missing settings remain enabled.
+An explicit list replaces (does not extend) the defaults: use only the third entry to suppress only that warning, or remove an entry to stop suppressing it. Disable all suppression with:
+
+```yaml
+plugins:
+  entries:
+    warning-filter:
+      settings:
+        patterns: []
+```
+
+Preserve other enabled plugins and settings. Invalid list types suppress nothing; non-string entries and invalid regexes are ignored individually, retaining valid siblings. Diagnostics identify the setting/index and failure type without logging message payloads or rule text. Invalid explicit settings never fall back to defaults. Rules are compiled when the plugin registers; restart the profile's Hermes process after settings changes. There is no automatic hot reload.
 
 ## Compatibility and verification
 
-Qualified against official Hermes Agent commit `2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19` on Python 3.14. Native tests exercise discovery, registration, Slack and logical Relay routing, send/edit/status/draft paths, stream finalization and cleanup, independent settings, unload, metadata/authentication construction, and the default delivery ledger's retry/recovery controls.
+Qualified against official Hermes Agent commit `2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19` on Python 3.14. Native tests exercise discovery, registration, Slack and logical Relay routing, send/edit/status/draft paths, stream finalization and cleanup, list replacement/removal/empty settings, custom rules, invalid-rule diagnostics, profile isolation, unload, metadata/authentication construction, and the default delivery ledger's retry/recovery controls.
 
 A filtered receipt is unsuccessful, has no message ID, is nonretryable and explicitly reports `filtered: true, delivered: false`. Final warnings are suppressed before an obligation is created, preventing ledger recovery from replaying them as recovered replies. Ordinary failures still use native retry/recovery.
 
